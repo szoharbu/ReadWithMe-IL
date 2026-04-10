@@ -41,6 +41,28 @@ def split_words(text: str) -> list[str]:
     return [w for w in re.split(r"\s+", text.strip()) if w]
 
 
+# (menu label, full passage). Add more stories as extra tuples later.
+READING_PASSAGES: list[tuple[str, str]] = [
+    (
+        "1 · Short practice",
+        "הַיֶּלֶד רָץ מַהֵר לַגִּינָה",
+    ),
+    (
+        "2 · Story: The computer in my room (full)",
+        " ".join(
+            [
+                "בַּחֶדֶר שֶׁלִּי יֵשׁ מַחְשֵׁב חָדָשׁ וְחָכָם.",
+                "בְּכָל בֹּקֶר אֲנִי מַדְלִיק אוֹתוֹ וְרוֹאֶה אוֹרוֹת צִבְעוֹנִיִּים.",
+                "אֲנִי אוֹהֵב לִכְתֹּב קוֹד וּלְצַיֵּר צִיּוּרִים יָפִים עַל הַמָּסָךְ.",
+                "הַמַּחְשֵׁב עוֹזֵר לִי לִלְמֹד דְּבָרִים חֲדָשִׁים עַל כּוֹכָבִים רְחוֹקִים וְעַל חַיּוֹת בַּיָּם.",
+                "אֲנִי חוֹלֵם שֶׁיּוֹם אֶחָד אֲנִי אֶבְנֶה רוֹבּוֹט אֲמִתִּי שֶׁיּוּכַל לְדַבֵּר אִתִּי.",
+                "עַד אָז, אֲנִי מַמְשִיךְ לְהִתְאַמֵּן וְלִקְרֹא בְּכָל יוֹם.",
+            ]
+        ),
+    ),
+]
+
+
 class ReadingCoach(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -50,7 +72,7 @@ class ReadingCoach(ctk.CTk):
         self.geometry("800x600")
         self.minsize(640, 480)
 
-        self.target_text = "הַיֶּלֶד רָץ מַהֵר לַגִּינָה"
+        self.target_text = READING_PASSAGES[0][1]
         self.is_recording = False
         self.max_word_progress = 0
         self.listen_timeout = ctk.DoubleVar(value=5.0)
@@ -67,6 +89,8 @@ class ReadingCoach(ctk.CTk):
         self._mic_level = 0.0  # smoothed 0..1 for UI meter
         # התאמה מעורפלת בין מילה למילה (ילדים: חיתוך עיצורים, בליעת עיצורים)
         self.word_match_ratio_threshold = 0.8
+        # Only transcribe the last N seconds + single-word prompt — less full-sentence drift
+        self.transcribe_focus_tail_sec = 1.5
 
         self.setup_ui()
 
@@ -90,8 +114,16 @@ class ReadingCoach(ctk.CTk):
         )
         return self._whisper_model
 
+    def _target_words_clean(self) -> list[str]:
+        return split_words(remove_niqqud(self.target_text).strip())
+
+    def _current_target_word(self) -> str | None:
+        words = self._target_words_clean()
+        i = self.max_word_progress
+        return words[i] if i < len(words) else None
+
     def _transcribe_numpy(self, samples) -> str:
-        """Transcribe mono float32 PCM (e.g. numpy array), 16 kHz."""
+        """Transcribe mono float32 PCM (e.g. numpy array), 16 kHz — tuned for one word at a time."""
         import numpy as np
 
         if samples is None or len(samples) < int(self._sample_rate * 0.18):
@@ -99,8 +131,11 @@ class ReadingCoach(ctk.CTk):
         x = np.asarray(samples, dtype=np.float32).reshape(-1)
         if x.size == 0:
             return ""
+        tail_sec = float(getattr(self, "transcribe_focus_tail_sec", 1.5))
+        max_tail = int(self._sample_rate * tail_sec)
+        if x.size > max_tail:
+            x = x[-max_tail:]
         model = self._ensure_whisper()
-        prompt = remove_niqqud(self.target_text).strip()
         transcribe_kw = {
             "language": "he",
             "beam_size": 1,
@@ -109,8 +144,9 @@ class ReadingCoach(ctk.CTk):
             "condition_on_previous_text": False,
             "without_timestamps": True,
         }
-        if prompt:
-            transcribe_kw["initial_prompt"] = prompt
+        cw = self._current_target_word()
+        if cw:
+            transcribe_kw["initial_prompt"] = cw
         with self._whisper_lock:
             segments, _info = model.transcribe(x, **transcribe_kw)
         parts = [s.text.strip() for s in segments if s.text.strip()]
@@ -124,15 +160,12 @@ class ReadingCoach(ctk.CTk):
             with os.fdopen(fd, "wb") as f:
                 f.write(wav_bytes)
             model = self._ensure_whisper()
-            prompt = remove_niqqud(self.target_text).strip()
             kw = {
                 "language": "he",
                 "beam_size": 1,
                 "best_of": 1,
                 "vad_filter": False,
             }
-            if prompt:
-                kw["initial_prompt"] = prompt
             with self._whisper_lock:
                 segments, _info = model.transcribe(path, **kw)
             parts = [s.text.strip() for s in segments if s.text.strip()]
@@ -167,6 +200,26 @@ class ReadingCoach(ctk.CTk):
             self, text="תרגול קריאה", font=(self._font_family, 24, "bold")
         )
         self.label_title.pack(pady=10, side="top")
+
+        self.passage_bar = ctk.CTkFrame(self, fg_color="transparent")
+        self.passage_bar.pack(fill="x", padx=28, pady=(0, 6))
+        ctk.CTkLabel(
+            self.passage_bar,
+            text="Practice text:",
+            font=(self._font_family, 15, "bold"),
+            text_color="#AAB4E0",
+        ).pack(side="left", padx=(0, 12))
+        self._passage_labels = [p[0] for p in READING_PASSAGES]
+        self.passage_menu = ctk.CTkOptionMenu(
+            self.passage_bar,
+            values=self._passage_labels,
+            command=self.on_passage_selected,
+            font=(self._font_family, 15),
+            width=520,
+            anchor="w",
+        )
+        self.passage_menu.pack(side="left", fill="x", expand=True)
+        self.passage_menu.set(self._passage_labels[0])
 
         # 2. כפתורים וסטטוס — לתחתית (לפני אזור האמצע כדי שיישארו גלויים)
         self.bottom_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -349,20 +402,47 @@ class ReadingCoach(ctk.CTk):
 
         done = self.max_word_progress
         fs = self.text_font_size.get()
+        n = len(words)
+        bold_font = ctk.CTkFont(
+            family=self._font_family, size=fs, weight="bold", underline=False
+        )
+        bold_underline_font = ctk.CTkFont(
+            family=self._font_family, size=fs, weight="bold", underline=True
+        )
         for i, word in enumerate(words):
-            color = "#2ECC71" if i < done else "#CCCCCC"
+            if i < done:
+                color = "#2ECC71"
+                font_arg = bold_font
+            elif i == done and done < n:
+                color = "#E8E8E8"
+                font_arg = bold_underline_font
+            else:
+                color = "#CCCCCC"
+                font_arg = bold_font
             ctk.CTkLabel(
                 self.words_inner,
                 text=word,
                 text_color=color,
-                font=(self._font_family, fs, "bold"),
+                font=font_arg,
             ).pack(side="right", padx=6, pady=8)
+
+    def sync_passage_menu_state(self) -> None:
+        self.passage_menu.configure(state="disabled" if self.is_recording else "normal")
+
+    def on_passage_selected(self, choice: str) -> None:
+        for label, text in READING_PASSAGES:
+            if label == choice:
+                self.target_text = text
+                break
+        self.max_word_progress = 0
+        self.update_display()
 
     def reset_practice(self):
         self.is_recording = False
         self.max_word_progress = 0
         self._set_record_button_idle()
         self.update_display()
+        self.sync_passage_menu_state()
         self.live_label.configure(
             text="Transcript will appear here while you speak."
         )
@@ -396,6 +476,7 @@ class ReadingCoach(ctk.CTk):
                 text="Starting… (first run loads Whisper)", text_color="white"
             )
             threading.Thread(target=self.process_audio_loop, daemon=True).start()
+            self.after(0, lambda: self._apply_stream_result(""))
         else:
             self.is_recording = False
             self._set_record_button_idle()
@@ -407,11 +488,19 @@ class ReadingCoach(ctk.CTk):
                 text="Microphone idle", text_color="gray"
             )
             self.status_label.configure(text="ההקלטה נעצרה", text_color="orange")
+        self.sync_passage_menu_state()
 
     def _apply_stream_result(self, text: str) -> None:
         preview = (text or "").strip()
+        cw = self._current_target_word()
+        if cw:
+            heard = preview if preview else "(listening…)"
+            self.live_label.configure(
+                text=f"Say this word: {cw}\nHeard: {heard[:120]}",
+            )
+        else:
+            self.live_label.configure(text="Sentence complete.")
         if preview:
-            self.live_label.configure(text=f"Transcript: {preview[:280]}")
             self.compare_texts(preview)
 
     def _level_ui_tick(self) -> None:
@@ -470,6 +559,7 @@ class ReadingCoach(ctk.CTk):
             set_status(str(e)[:200], "red")
             self.is_recording = False
             self.after(0, self._set_record_button_idle)
+            self.after(0, self.sync_passage_menu_state)
             return
 
         try:
@@ -478,6 +568,7 @@ class ReadingCoach(ctk.CTk):
             set_status("Install: pip install PyAudio numpy", "red")
             self.is_recording = False
             self.after(0, self._set_record_button_idle)
+            self.after(0, self.sync_passage_menu_state)
             return
 
         sr = self._sample_rate
@@ -534,6 +625,7 @@ class ReadingCoach(ctk.CTk):
                     ),
                 )
                 self.is_recording = False
+                self.after(0, self.sync_passage_menu_state)
             finally:
                 if stream is not None:
                     try:
@@ -587,10 +679,7 @@ class ReadingCoach(ctk.CTk):
                     "#AED6F1",
                 )
 
-            if not (text or "").strip():
-                continue
-
-            self.after(0, lambda t=text: self._apply_stream_result(t))
+            self.after(0, lambda t=text or "": self._apply_stream_result(t))
 
         with self._audio_lock:
             self._audio_buffer = None
@@ -606,6 +695,7 @@ class ReadingCoach(ctk.CTk):
     def _on_record_loop_stopped(self):
         if not self.is_recording:
             self._set_record_button_idle()
+            self.sync_passage_menu_state()
 
     @staticmethod
     def _clean_google_words(text: str) -> str:
@@ -632,16 +722,24 @@ class ReadingCoach(ctk.CTk):
         target_words = split_words(target_clean)
         rec_words = split_words(rec_clean)
 
-        # רצף מילים מההתחלה בהקלט הנוכחי (התאמה מדויקת או דמיון מילולי)
-        current_match = 0
-        for i in range(len(target_words)):
-            if i < len(rec_words) and self.is_word_match(rec_words[i], target_words[i]):
-                current_match = i + 1
-            else:
-                break
+        if not target_words:
+            return
 
-        if current_match > self.max_word_progress:
-            self.max_word_progress = current_match
+        cur = self.max_word_progress
+        if cur >= len(target_words):
+            return
+
+        tw = target_words[cur]
+        # Any token in this short tail transcript can match the one word we care about now
+        matched = any(self.is_word_match(rw, tw) for rw in rec_words)
+
+        prev = self.max_word_progress
+        candidate = cur + 1 if matched else cur
+        candidate = min(candidate, len(target_words))
+        new_total = max(prev, min(candidate, prev + 1))
+        self.max_word_progress = new_total
+
+        current_match = new_total
 
         self.update_display()
 
@@ -652,6 +750,7 @@ class ReadingCoach(ctk.CTk):
             )
             self.is_recording = False
             self._set_record_button_idle()
+            self.sync_passage_menu_state()
         elif self.max_word_progress > 0:
             self.status_label.configure(
                 text=(
