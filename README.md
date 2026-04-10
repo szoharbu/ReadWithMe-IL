@@ -1,9 +1,9 @@
 # ReadWithMe-IL
 AI-Powered Interactive Reading Assistant for Hebrew-Speaking Children
-ReadingCoach-IL is a desktop application designed to help children (specifically ages 7–9) improve their Hebrew reading fluency and pronunciation. Using Speech-to-Text (STT) technology, the app "listens" to the child reading aloud and provides real-time visual feedback by highlighting correctly spoken words.
+ReadWithMe-IL is a desktop application designed to help children (specifically ages 7–9) improve their Hebrew reading fluency and pronunciation. Using Speech-to-Text (STT) technology, the app "listens" to the child reading aloud and provides real-time visual feedback by highlighting correctly spoken words.
 
 🚀 Overview
-Learning to read Hebrew with correct grammar and Niqqud (vowels) can be challenging. This tool provides a patient, non-judgmental environment for children to practice. By bridging the gap between complex AI speech models and a child-friendly interface, ReadingCoach-IL turns a standard reading exercise into an interactive experience.
+Learning to read Hebrew with correct grammar and Niqqud (vowels) can be challenging. This tool provides a patient, non-judgmental environment for children to practice. By bridging the gap between complex AI speech models and a child-friendly interface, ReadWithMe-IL turns a standard reading exercise into an interactive experience.
 
 ✨ Key Features
 Real-time Hebrew STT: Leverages Google Speech Recognition API specifically configured for Hebrew (he-IL).

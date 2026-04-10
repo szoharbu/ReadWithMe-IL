@@ -1,11 +1,22 @@
 # -*- coding: utf-8 -*-
+import os
 import re
 import sys
+import tempfile
 import threading
+import warnings
 import tkinter.font as tkfont
 
 import customtkinter as ctk
 import speech_recognition as sr
+
+# Quieter Hugging Face cache on Windows (no symlink support)
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+warnings.filterwarnings(
+    "ignore",
+    message=".*symlinks.*",
+    category=UserWarning,
+)
 
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
     try:
@@ -44,7 +55,49 @@ class ReadingCoach(ctk.CTk):
         self.text_font_size = ctk.IntVar(value=45)
 
         self.recognizer = sr.Recognizer()
+        self._whisper_model = None
+        self._whisper_lock = threading.Lock()
+        self.whisper_model_size = "tiny"
+
         self.setup_ui()
+
+    def _ensure_whisper(self):
+        if self._whisper_model is not None:
+            return self._whisper_model
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as e:
+            raise RuntimeError("Install: pip install faster-whisper") from e
+        self._whisper_model = WhisperModel(
+            self.whisper_model_size,
+            device="cpu",
+            compute_type="int8",
+        )
+        return self._whisper_model
+
+    def _transcribe_audio(self, audio: sr.AudioData) -> str:
+        """המרת AudioData מ־SpeechRecognition ל־WAV זמני ותמלול בעברית."""
+        wav_bytes = audio.get_wav_data()
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(wav_bytes)
+            model = self._ensure_whisper()
+            with self._whisper_lock:
+                # vad_filter can drop quiet speech; keep off for short kid utterances
+                segments, _info = model.transcribe(
+                    path,
+                    language="he",
+                    beam_size=5,
+                    vad_filter=False,
+                )
+            parts = [s.text.strip() for s in segments if s.text.strip()]
+            return " ".join(parts)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     def _pick_hebrew_font(self) -> str:
         try:
@@ -250,7 +303,9 @@ class ReadingCoach(ctk.CTk):
             self.max_word_progress = 0
             self.update_display()
             self._set_record_button_recording()
-            self.status_label.configure(text="מקשיב… דבר/י בבקשה", text_color="white")
+            self.status_label.configure(
+                text="Starting… (first run loads Whisper)", text_color="white"
+            )
             threading.Thread(target=self.process_audio_loop, daemon=True).start()
         else:
             self.is_recording = False
@@ -258,53 +313,68 @@ class ReadingCoach(ctk.CTk):
             self.status_label.configure(text="ההקלטה נעצרה", text_color="orange")
 
     def process_audio_loop(self):
-        """לולאה (לא רקורסיה) + סנכרון ל-main thread לפני האזנה נוספת — מונע מירוץ עם is_recording."""
+        """Background capture + Whisper; model preloaded before first listen."""
+
+        def set_status(msg: str, color: str = "white") -> None:
+            self.after(
+                0,
+                lambda m=msg, c=color: self.status_label.configure(
+                    text=m, text_color=c
+                ),
+            )
+
+        set_status("Loading Whisper model (first run may download ~75MB)…", "#AED6F1")
+        try:
+            self._ensure_whisper()
+        except RuntimeError as e:
+            set_status(str(e)[:200], "red")
+            self.is_recording = False
+            self.after(0, self._set_record_button_idle)
+            return
+
+        ambient_done = False
         while self.is_recording:
             with sr.Microphone() as source:
                 try:
-                    self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                    if not ambient_done:
+                        self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                        ambient_done = True
                     timeout = float(self.listen_timeout.get())
+                    phrase_limit = min(30.0, max(10.0, timeout + 8.0))
+                    set_status("Listening… speak now.", "white")
                     audio = self.recognizer.listen(
-                        source, timeout=timeout, phrase_time_limit=5
+                        source,
+                        timeout=timeout,
+                        phrase_time_limit=phrase_limit,
                     )
-                    recognized = self.recognizer.recognize_google(
-                        audio, language="he-IL"
-                    )
-                except sr.WaitTimeoutError:
+                    set_status("Transcribing…", "#AED6F1")
+                    recognized = self._transcribe_audio(audio)
+                    if not (recognized or "").strip():
+                        set_status(
+                            "No words recognized — speak louder or check mic.",
+                            "orange",
+                        )
+                        continue
+                except RuntimeError as e:
+                    msg = str(e)
                     self.after(
                         0,
-                        lambda: self.status_label.configure(
-                            text="לא נשמע דיבור — ממשיך להאזין…",
-                            text_color="orange",
+                        lambda m=msg: self.status_label.configure(
+                            text=m[:120], text_color="red"
                         ),
+                    )
+                    continue
+                except sr.WaitTimeoutError:
+                    set_status(
+                        "No speech detected in time — still listening…",
+                        "orange",
                     )
                     continue
                 except sr.UnknownValueError:
-                    self.after(
-                        0,
-                        lambda: self.status_label.configure(
-                            text="לא זיהיתי מילים — נסה שוב",
-                            text_color="orange",
-                        ),
-                    )
+                    set_status("Could not decode audio — try again.", "orange")
                     continue
-                except sr.RequestError:
-                    self.after(
-                        0,
-                        lambda: self.status_label.configure(
-                            text="בעיית רשת בזיהוי דיבור",
-                            text_color="red",
-                        ),
-                    )
-                    continue
-                except Exception:
-                    self.after(
-                        0,
-                        lambda: self.status_label.configure(
-                            text="שגיאה בהקלטה, נסה שוב",
-                            text_color="red",
-                        ),
-                    )
+                except Exception as ex:
+                    set_status(f"Audio error: {ex!s}"[:160], "red")
                     continue
 
                 sync = threading.Event()
@@ -326,7 +396,7 @@ class ReadingCoach(ctk.CTk):
 
     @staticmethod
     def _clean_google_words(text: str) -> str:
-        """ניקוי ניקוד ואז תווים שאינם אותיות/רווח (פיסוק מהקלט של גוגל)."""
+        """ניקוי ניקוד ותווים שאינם אותיות/רווח (פיסוק מהתמלול)."""
         no_niq = remove_niqqud(text)
         no_punct = re.sub(r"[^\w\s]", "", no_niq, flags=re.UNICODE)
         return re.sub(r"\s+", " ", no_punct).strip()
