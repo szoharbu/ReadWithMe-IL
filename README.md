@@ -29,8 +29,8 @@ Logic: Regular Expressions (Regex) for Niqqud stripping and custom string-mappin
 Clone the repository:
 
 Bash
-git clone https://gitlab.com/szoharbu/ReadWithMe-IL/read.git
-cd readingcoach-il
+git clone https://github.com/szoharbu/ReadWithMe-IL.git
+cd ReadWithMe-IL
 Install dependencies:
 
 Bash
