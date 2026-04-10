@@ -1,0 +1,378 @@
+# -*- coding: utf-8 -*-
+import re
+import sys
+import threading
+import tkinter.font as tkfont
+
+import customtkinter as ctk
+import speech_recognition as sr
+
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+NIQQUD_RE = re.compile(r"[\u0591-\u05C7]")
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+
+def remove_niqqud(text: str) -> str:
+    return NIQQUD_RE.sub("", text)
+
+
+def split_words(text: str) -> list[str]:
+    return [w for w in re.split(r"\s+", text.strip()) if w]
+
+
+class ReadingCoach(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self._font_family = self._pick_hebrew_font()
+
+        self.title("מאמן קריאה חכם - עברית")
+        self.geometry("800x600")
+        self.minsize(640, 480)
+
+        self.target_text = "הַיֶּלֶד רָץ מַהֵר לַגִּינָה"
+        self.is_recording = False
+        self.max_word_progress = 0
+        self.listen_timeout = ctk.DoubleVar(value=5.0)
+        self.text_font_size = ctk.IntVar(value=45)
+
+        self.recognizer = sr.Recognizer()
+        self.setup_ui()
+
+    def _pick_hebrew_font(self) -> str:
+        try:
+            families = set(tkfont.families(root=self))
+        except Exception:
+            families = set()
+        for name in (
+            "Segoe UI",
+            "Segoe UI Hebrew",
+            "David",
+            "Gisha",
+            "Miriam",
+            "Tahoma",
+            "Arial",
+        ):
+            if name in families:
+                return name
+        return "Arial"
+
+    def setup_ui(self):
+        # 1. כותרת — למעלה
+        self.label_title = ctk.CTkLabel(
+            self, text="תרגול קריאה", font=(self._font_family, 24, "bold")
+        )
+        self.label_title.pack(pady=10, side="top")
+
+        # 2. כפתורים וסטטוס — לתחתית (לפני אזור האמצע כדי שיישארו גלויים)
+        self.bottom_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.bottom_frame.pack(side="bottom", pady=20)
+
+        self.btn_record = ctk.CTkButton(
+            self.bottom_frame,
+            text="התחל הקלטה 🎤",
+            command=self.toggle_listening,
+            width=200,
+            height=50,
+            font=(self._font_family, 18, "bold"),
+            fg_color="#3498DB",
+        )
+        self.btn_record.grid(row=0, column=0, padx=10)
+
+        self.btn_reset = ctk.CTkButton(
+            self.bottom_frame,
+            text="איפוס 🔄",
+            command=self.reset_practice,
+            width=120,
+            height=50,
+            fg_color="gray",
+            font=(self._font_family, 16),
+        )
+        self.btn_reset.grid(row=0, column=1, padx=10)
+
+        self.btn_settings = ctk.CTkButton(
+            self.bottom_frame,
+            text="הגדרות ⚙",
+            command=self.open_settings,
+            width=140,
+            height=50,
+            fg_color="#555",
+            font=(self._font_family, 16),
+        )
+        self.btn_settings.grid(row=0, column=2, padx=10)
+
+        self.status_label = ctk.CTkLabel(
+            self, text="מוכן לתרגול", font=(self._font_family, 16)
+        )
+        self.status_label.pack(side="bottom", pady=5)
+
+        # 3. תיבת טקסט — ממלאת את השטח שנשאר באמצע
+        self.text_frame = ctk.CTkFrame(self, fg_color="#242424", corner_radius=15)
+        self.text_frame.pack(pady=10, padx=40, fill="both", expand=True)
+
+        # מילים נפרדות + pack(side="right") — RTL אמיתי בלי tk.Text (שמזעזע עברית עם תגיות)
+        self.words_inner = ctk.CTkFrame(self.text_frame, fg_color="#242424")
+        self.words_inner.pack(fill="both", expand=True, padx=20, pady=20)
+
+        self.update_display()
+
+    def open_settings(self):
+        win = ctk.CTkToplevel(self)
+        win.title("הגדרות")
+        win.geometry("520x420")
+        win.transient(self)
+        win.grab_set()
+
+        ctk.CTkLabel(
+            win, text="משפט לתרגול (עם ניקוד או בלי):", font=(self._font_family, 14)
+        ).pack(anchor="w", padx=16, pady=(16, 4))
+        box = ctk.CTkTextbox(win, height=100, font=(self._font_family, 16))
+        box.pack(fill="x", padx=16, pady=(0, 8))
+        box.insert("1.0", self.target_text)
+
+        ctk.CTkLabel(
+            win, text="זמן המתנה לדיבור (שניות):", font=(self._font_family, 14)
+        ).pack(anchor="w", padx=16, pady=(8, 0))
+        ctk.CTkSlider(
+            win,
+            from_=3,
+            to=15,
+            number_of_steps=24,
+            variable=self.listen_timeout,
+        ).pack(fill="x", padx=16, pady=6)
+
+        ctk.CTkLabel(
+            win, text="גודל גופן טקסט המשפט:", font=(self._font_family, 14)
+        ).pack(anchor="w", padx=16, pady=(8, 0))
+        ctk.CTkSlider(
+            win,
+            from_=24,
+            to=56,
+            number_of_steps=32,
+            variable=self.text_font_size,
+            command=lambda _: self._apply_font_size(),
+        ).pack(fill="x", padx=16, pady=6)
+
+        ctk.CTkLabel(win, text="מצב תצוגה:", font=(self._font_family, 14)).pack(
+            anchor="w", padx=16, pady=(8, 0)
+        )
+        try:
+            _mode = ctk.get_appearance_mode()
+        except Exception:
+            _mode = "dark"
+        mode_var = ctk.StringVar(value=_mode)
+        ctk.CTkOptionMenu(
+            win,
+            values=["dark", "light", "system"],
+            variable=mode_var,
+            command=lambda m: ctk.set_appearance_mode(m),
+            font=(self._font_family, 14),
+        ).pack(anchor="w", padx=16, pady=6)
+
+        def apply_and_close():
+            raw = box.get("1.0", "end").strip()
+            if raw:
+                self.target_text = raw
+                self.max_word_progress = 0
+                self.update_display()
+            win.destroy()
+
+        ctk.CTkButton(
+            win,
+            text="שמור והחל",
+            command=apply_and_close,
+            font=(self._font_family, 16),
+            height=40,
+        ).pack(pady=20)
+
+    def _apply_font_size(self):
+        self.update_display()
+
+    def update_display(self):
+        """מציג כל מילה כ־Label; מילים שנקראו בירוק. סדר: ימין→שמאל (המילה הראשונה בימין)."""
+        for child in self.words_inner.winfo_children():
+            child.destroy()
+
+        words = split_words(self.target_text)
+        if not words:
+            ctk.CTkLabel(
+                self.words_inner,
+                text="(הוסף משפט בהגדרות)",
+                text_color="gray",
+                font=(self._font_family, 20),
+            ).pack(anchor="center", expand=True)
+            return
+
+        done = self.max_word_progress
+        fs = self.text_font_size.get()
+        for i, word in enumerate(words):
+            color = "#2ECC71" if i < done else "#CCCCCC"
+            ctk.CTkLabel(
+                self.words_inner,
+                text=word,
+                text_color=color,
+                font=(self._font_family, fs, "bold"),
+            ).pack(side="right", padx=6, pady=8)
+
+    def reset_practice(self):
+        self.is_recording = False
+        self.max_word_progress = 0
+        self._set_record_button_idle()
+        self.update_display()
+        self.status_label.configure(
+            text="התרגול אופס. מוכן להתחלה", text_color="white"
+        )
+
+    def _set_record_button_idle(self):
+        self.btn_record.configure(
+            text="התחל הקלטה 🎤",
+            fg_color="#3498DB",
+            state="normal",
+        )
+
+    def _set_record_button_recording(self):
+        self.btn_record.configure(
+            text="עצור הקלטה ⏹",
+            fg_color="#C0392B",
+            state="normal",
+        )
+
+    def toggle_listening(self):
+        if not self.is_recording:
+            self.is_recording = True
+            self.max_word_progress = 0
+            self.update_display()
+            self._set_record_button_recording()
+            self.status_label.configure(text="מקשיב… דבר/י בבקשה", text_color="white")
+            threading.Thread(target=self.process_audio_loop, daemon=True).start()
+        else:
+            self.is_recording = False
+            self._set_record_button_idle()
+            self.status_label.configure(text="ההקלטה נעצרה", text_color="orange")
+
+    def process_audio_loop(self):
+        """לולאה (לא רקורסיה) + סנכרון ל-main thread לפני האזנה נוספת — מונע מירוץ עם is_recording."""
+        while self.is_recording:
+            with sr.Microphone() as source:
+                try:
+                    self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                    timeout = float(self.listen_timeout.get())
+                    audio = self.recognizer.listen(
+                        source, timeout=timeout, phrase_time_limit=5
+                    )
+                    recognized = self.recognizer.recognize_google(
+                        audio, language="he-IL"
+                    )
+                except sr.WaitTimeoutError:
+                    self.after(
+                        0,
+                        lambda: self.status_label.configure(
+                            text="לא נשמע דיבור — ממשיך להאזין…",
+                            text_color="orange",
+                        ),
+                    )
+                    continue
+                except sr.UnknownValueError:
+                    self.after(
+                        0,
+                        lambda: self.status_label.configure(
+                            text="לא זיהיתי מילים — נסה שוב",
+                            text_color="orange",
+                        ),
+                    )
+                    continue
+                except sr.RequestError:
+                    self.after(
+                        0,
+                        lambda: self.status_label.configure(
+                            text="בעיית רשת בזיהוי דיבור",
+                            text_color="red",
+                        ),
+                    )
+                    continue
+                except Exception:
+                    self.after(
+                        0,
+                        lambda: self.status_label.configure(
+                            text="שגיאה בהקלטה, נסה שוב",
+                            text_color="red",
+                        ),
+                    )
+                    continue
+
+                sync = threading.Event()
+
+                def apply_result(rec=recognized):
+                    try:
+                        self.compare_texts(rec)
+                    finally:
+                        sync.set()
+
+                self.after(0, apply_result)
+                sync.wait(timeout=30)
+
+        self.after(0, self._on_record_loop_stopped)
+
+    def _on_record_loop_stopped(self):
+        if not self.is_recording:
+            self._set_record_button_idle()
+
+    @staticmethod
+    def _clean_google_words(text: str) -> str:
+        """ניקוי ניקוד ואז תווים שאינם אותיות/רווח (פיסוק מהקלט של גוגל)."""
+        no_niq = remove_niqqud(text)
+        no_punct = re.sub(r"[^\w\s]", "", no_niq, flags=re.UNICODE)
+        return re.sub(r"\s+", " ", no_punct).strip()
+
+    def compare_texts(self, recognized: str):
+        target_clean = remove_niqqud(self.target_text).strip()
+        rec_clean = self._clean_google_words(recognized)
+
+        target_words = split_words(target_clean)
+        rec_words = split_words(rec_clean)
+
+        # רצף מילים מההתחלה בהקלט הנוכחי
+        current_match = 0
+        for i in range(len(target_words)):
+            if i < len(rec_words) and target_words[i] == rec_words[i]:
+                current_match = i + 1
+            else:
+                break
+
+        if current_match > self.max_word_progress:
+            self.max_word_progress = current_match
+
+        self.update_display()
+
+        n_target = len(target_words)
+        if n_target > 0 and self.max_word_progress >= n_target:
+            self.status_label.configure(
+                text="אלוף! סיימת את המשפט! 🎉", text_color="green"
+            )
+            self.is_recording = False
+            self._set_record_button_idle()
+        elif self.max_word_progress > 0:
+            self.status_label.configure(
+                text=(
+                    f"התקדמות (שיא בסשן): {self.max_word_progress}/{n_target} מילים "
+                    f"· בהקלטה האחרונה: {current_match}/{n_target}"
+                ),
+                text_color="#AED6F1",
+            )
+        else:
+            self.status_label.configure(
+                text=f"שמעתי: {recognized} — נסה להתאים למשפט מההתחלה",
+                text_color="orange",
+            )
+
+
+if __name__ == "__main__":
+    app = ReadingCoach()
+    app.mainloop()
