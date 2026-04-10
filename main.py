@@ -2,6 +2,7 @@
 import os
 import re
 import sys
+from difflib import SequenceMatcher
 import tempfile
 import threading
 import time
@@ -59,10 +60,13 @@ class ReadingCoach(ctk.CTk):
         self._whisper_model = None
         self._whisper_lock = threading.Lock()
         self.whisper_model_size = "tiny"
+        self._whisper_backend_label = "CPU"
         self._audio_lock = threading.Lock()
         self._audio_buffer = None  # numpy float32 mono, set when streaming starts
         self._sample_rate = 16000
         self._mic_level = 0.0  # smoothed 0..1 for UI meter
+        # התאמה מעורפלת בין מילה למילה (ילדים: חיתוך עיצורים, בליעת עיצורים)
+        self.word_match_ratio_threshold = 0.8
 
         self.setup_ui()
 
@@ -73,10 +77,16 @@ class ReadingCoach(ctk.CTk):
             from faster_whisper import WhisperModel
         except ImportError as e:
             raise RuntimeError("Install: pip install faster-whisper") from e
+
+        # CPU: int8 quantization (~2–3× faster than float); tiny = smallest / fastest.
+        import os as _os
+
+        self._whisper_backend_label = "CPU"
         self._whisper_model = WhisperModel(
             self.whisper_model_size,
             device="cpu",
             compute_type="int8",
+            cpu_threads=min(8, max(2, (_os.cpu_count() or 4))),
         )
         return self._whisper_model
 
@@ -84,22 +94,25 @@ class ReadingCoach(ctk.CTk):
         """Transcribe mono float32 PCM (e.g. numpy array), 16 kHz."""
         import numpy as np
 
-        if samples is None or len(samples) < int(self._sample_rate * 0.25):
+        if samples is None or len(samples) < int(self._sample_rate * 0.18):
             return ""
         x = np.asarray(samples, dtype=np.float32).reshape(-1)
         if x.size == 0:
             return ""
         model = self._ensure_whisper()
+        prompt = remove_niqqud(self.target_text).strip()
+        transcribe_kw = {
+            "language": "he",
+            "beam_size": 1,
+            "best_of": 1,
+            "vad_filter": False,
+            "condition_on_previous_text": False,
+            "without_timestamps": True,
+        }
+        if prompt:
+            transcribe_kw["initial_prompt"] = prompt
         with self._whisper_lock:
-            segments, _info = model.transcribe(
-                x,
-                language="he",
-                beam_size=1,
-                best_of=1,
-                vad_filter=False,
-                condition_on_previous_text=False,
-                without_timestamps=True,
-            )
+            segments, _info = model.transcribe(x, **transcribe_kw)
         parts = [s.text.strip() for s in segments if s.text.strip()]
         return " ".join(parts)
 
@@ -111,14 +124,17 @@ class ReadingCoach(ctk.CTk):
             with os.fdopen(fd, "wb") as f:
                 f.write(wav_bytes)
             model = self._ensure_whisper()
+            prompt = remove_niqqud(self.target_text).strip()
+            kw = {
+                "language": "he",
+                "beam_size": 1,
+                "best_of": 1,
+                "vad_filter": False,
+            }
+            if prompt:
+                kw["initial_prompt"] = prompt
             with self._whisper_lock:
-                # vad_filter can drop quiet speech; keep off for short kid utterances
-                segments, _info = model.transcribe(
-                    path,
-                    language="he",
-                    beam_size=5,
-                    vad_filter=False,
-                )
+                segments, _info = model.transcribe(path, **kw)
             parts = [s.text.strip() for s in segments if s.text.strip()]
             return " ".join(parts)
         finally:
@@ -440,9 +456,16 @@ class ReadingCoach(ctk.CTk):
         def set_live(msg: str) -> None:
             self.after(0, lambda m=msg: self.live_label.configure(text=m))
 
-        set_status("Loading Whisper model (first run may download ~75MB)…", "#AED6F1")
+        set_status(
+            "Loading Whisper (first run may download ~75MB)…",
+            "#AED6F1",
+        )
         try:
             self._ensure_whisper()
+            set_status(
+                f"Whisper ready ({getattr(self, '_whisper_backend_label', 'CPU')}) — listening…",
+                "#AED6F1",
+            )
         except RuntimeError as e:
             set_status(str(e)[:200], "red")
             self.is_recording = False
@@ -450,48 +473,58 @@ class ReadingCoach(ctk.CTk):
             return
 
         try:
-            import sounddevice as sd
+            import pyaudio
         except ImportError:
-            set_status("Install: pip install sounddevice numpy", "red")
+            set_status("Install: pip install PyAudio numpy", "red")
             self.is_recording = False
             self.after(0, self._set_record_button_idle)
             return
 
         sr = self._sample_rate
-        # Shorter window + faster step → snappier (more CPU)
-        step = 0.55
-        max_buf_sec = 5.5
+        # מרווח ארוך יותר על CPU — פחות עומס מחזורי transcribe; אפשר להוריד ל-0.45 אם חלק
+        step = 0.6
+        max_buf_sec = 3.0
         max_samples = int(sr * max_buf_sec)
+        frames_per_buffer = 4000  # 0.25 s @ 16 kHz per read()
 
         with self._audio_lock:
             self._audio_buffer = np.zeros(0, dtype=np.float32)
 
         def mic_reader():
-            block = int(sr * 0.05)
+            pa = None
+            stream = None
             try:
-                with sd.InputStream(
-                    samplerate=sr,
+                pa = pyaudio.PyAudio()
+                stream = pa.open(
+                    format=pyaudio.paInt16,
                     channels=1,
-                    dtype=np.float32,
-                    blocksize=block,
-                ) as stream:
-                    while self.is_recording:
-                        data, overflowed = stream.read(block)
-                        if overflowed:
-                            pass
-                        chunk = np.asarray(data, dtype=np.float32).reshape(-1)
-                        if chunk.size:
-                            rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
-                            instant = min(1.0, rms * 12.0)
-                            with self._audio_lock:
-                                b = self._audio_buffer
-                                if b is None:
-                                    continue
-                                prev = float(getattr(self, "_mic_level", 0.0))
-                                self._mic_level = prev * 0.78 + instant * 0.22
-                                self._audio_buffer = np.concatenate([b, chunk])
-                                if self._audio_buffer.size > max_samples:
-                                    self._audio_buffer = self._audio_buffer[-max_samples:]
+                    rate=sr,
+                    input=True,
+                    frames_per_buffer=frames_per_buffer,
+                )
+                while self.is_recording:
+                    data = stream.read(
+                        frames_per_buffer,
+                        exception_on_overflow=False,
+                    )
+                    chunk = (
+                        np.frombuffer(data, dtype=np.int16)
+                        .astype(np.float32)
+                        .reshape(-1)
+                    )
+                    chunk /= 32768.0
+                    if chunk.size:
+                        rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
+                        instant = min(1.0, rms * 12.0)
+                        with self._audio_lock:
+                            b = self._audio_buffer
+                            if b is None:
+                                continue
+                            prev = float(getattr(self, "_mic_level", 0.0))
+                            self._mic_level = prev * 0.78 + instant * 0.22
+                            self._audio_buffer = np.concatenate([b, chunk])
+                            if self._audio_buffer.size > max_samples:
+                                self._audio_buffer = self._audio_buffer[-max_samples:]
             except Exception as ex:
                 self.after(
                     0,
@@ -501,6 +534,18 @@ class ReadingCoach(ctk.CTk):
                     ),
                 )
                 self.is_recording = False
+            finally:
+                if stream is not None:
+                    try:
+                        stream.stop_stream()
+                        stream.close()
+                    except Exception:
+                        pass
+                if pa is not None:
+                    try:
+                        pa.terminate()
+                    except Exception:
+                        pass
 
         reader = threading.Thread(target=mic_reader, daemon=True)
         reader.start()
@@ -519,7 +564,7 @@ class ReadingCoach(ctk.CTk):
                     if self._audio_buffer is None
                     else self._audio_buffer.copy()
                 )
-            if snap is None or snap.size < int(sr * 0.22):
+            if snap is None or snap.size < int(sr * 0.18):
                 continue
 
             set_status("Transcribing…", "#AED6F1")
@@ -569,6 +614,17 @@ class ReadingCoach(ctk.CTk):
         no_punct = re.sub(r"[^\w\s]", "", no_niq, flags=re.UNICODE)
         return re.sub(r"\s+", " ", no_punct).strip()
 
+    def is_word_match(self, spoken_word: str, target_word: str) -> bool:
+        """האם המילה הדומה מספיק ליעד (הגייה / טעויות מודל קלות)."""
+        s1 = spoken_word.strip()
+        s2 = target_word.strip()
+        if s1 == s2:
+            return True
+        if not s1 or not s2:
+            return False
+        thr = float(getattr(self, "word_match_ratio_threshold", 0.8))
+        return SequenceMatcher(None, s1, s2).ratio() >= thr
+
     def compare_texts(self, recognized: str):
         target_clean = remove_niqqud(self.target_text).strip()
         rec_clean = self._clean_google_words(recognized)
@@ -576,10 +632,10 @@ class ReadingCoach(ctk.CTk):
         target_words = split_words(target_clean)
         rec_words = split_words(rec_clean)
 
-        # רצף מילים מההתחלה בהקלט הנוכחי
+        # רצף מילים מההתחלה בהקלט הנוכחי (התאמה מדויקת או דמיון מילולי)
         current_match = 0
         for i in range(len(target_words)):
-            if i < len(rec_words) and target_words[i] == rec_words[i]:
+            if i < len(rec_words) and self.is_word_match(rec_words[i], target_words[i]):
                 current_match = i + 1
             else:
                 break
