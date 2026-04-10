@@ -2,3 +2,5 @@ SpeechRecognition
 PyAudio
 customtkinter
 faster-whisper
+sounddevice
+numpy

@@ -4,6 +4,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import warnings
 import tkinter.font as tkfont
 
@@ -58,6 +59,10 @@ class ReadingCoach(ctk.CTk):
         self._whisper_model = None
         self._whisper_lock = threading.Lock()
         self.whisper_model_size = "tiny"
+        self._audio_lock = threading.Lock()
+        self._audio_buffer = None  # numpy float32 mono, set when streaming starts
+        self._sample_rate = 16000
+        self._mic_level = 0.0  # smoothed 0..1 for UI meter
 
         self.setup_ui()
 
@@ -74,6 +79,29 @@ class ReadingCoach(ctk.CTk):
             compute_type="int8",
         )
         return self._whisper_model
+
+    def _transcribe_numpy(self, samples) -> str:
+        """Transcribe mono float32 PCM (e.g. numpy array), 16 kHz."""
+        import numpy as np
+
+        if samples is None or len(samples) < int(self._sample_rate * 0.25):
+            return ""
+        x = np.asarray(samples, dtype=np.float32).reshape(-1)
+        if x.size == 0:
+            return ""
+        model = self._ensure_whisper()
+        with self._whisper_lock:
+            segments, _info = model.transcribe(
+                x,
+                language="he",
+                beam_size=1,
+                best_of=1,
+                vad_filter=False,
+                condition_on_previous_text=False,
+                without_timestamps=True,
+            )
+        parts = [s.text.strip() for s in segments if s.text.strip()]
+        return " ".join(parts)
 
     def _transcribe_audio(self, audio: sr.AudioData) -> str:
         """המרת AudioData מ־SpeechRecognition ל־WAV זמני ותמלול בעברית."""
@@ -170,9 +198,49 @@ class ReadingCoach(ctk.CTk):
         self.text_frame = ctk.CTkFrame(self, fg_color="#242424", corner_radius=15)
         self.text_frame.pack(pady=10, padx=40, fill="both", expand=True)
 
-        # מילים נפרדות + pack(side="right") — RTL אמיתי בלי tk.Text (שמזעזע עברית עם תגיות)
+        # Bottom strip: thin L→R level line + large transcript (pack bottom first, words above)
+        self.hearing_frame = ctk.CTkFrame(self.text_frame, fg_color="#1a1d2e", corner_radius=12)
+        self.hearing_frame.pack(side="bottom", fill="x", padx=10, pady=(0, 14))
+
+        ctk.CTkLabel(
+            self.hearing_frame,
+            text="What the app hears",
+            font=(self._font_family, 13, "bold"),
+            text_color="#AAB4E0",
+        ).pack(anchor="w", padx=14, pady=(10, 4))
+
+        # Single horizontal meter: full width, low height (fills left → right)
+        self.input_level_bar = ctk.CTkProgressBar(
+            self.hearing_frame,
+            height=6,
+            progress_color="#2ECC71",
+            fg_color="#2a2d3e",
+        )
+        self.input_level_bar.set(0)
+        self.input_level_bar.pack(fill="x", padx=14, pady=(4, 6))
+
+        self.input_level_hint = ctk.CTkLabel(
+            self.hearing_frame,
+            text="Microphone idle",
+            font=(self._font_family, 11),
+            text_color="gray",
+        )
+        self.input_level_hint.pack(anchor="w", padx=14, pady=(0, 6))
+
+        self.live_label = ctk.CTkLabel(
+            self.hearing_frame,
+            text="Transcript will appear here while you speak.",
+            font=(self._font_family, 26, "bold"),
+            text_color="#D0DCFF",
+            wraplength=620,
+            justify="center",
+        )
+        self.live_label.pack(fill="x", padx=14, pady=(0, 16))
+
         self.words_inner = ctk.CTkFrame(self.text_frame, fg_color="#242424")
-        self.words_inner.pack(fill="both", expand=True, padx=20, pady=20)
+        self.words_inner.pack(
+            fill="both", expand=True, padx=20, pady=(20, 8)
+        )
 
         self.update_display()
 
@@ -279,6 +347,11 @@ class ReadingCoach(ctk.CTk):
         self.max_word_progress = 0
         self._set_record_button_idle()
         self.update_display()
+        self.live_label.configure(
+            text="Transcript will appear here while you speak."
+        )
+        self.input_level_bar.set(0)
+        self.input_level_hint.configure(text="Microphone idle", text_color="gray")
         self.status_label.configure(
             text="התרגול אופס. מוכן להתחלה", text_color="white"
         )
@@ -310,10 +383,51 @@ class ReadingCoach(ctk.CTk):
         else:
             self.is_recording = False
             self._set_record_button_idle()
+            self.live_label.configure(
+                text="Transcript will appear here while you speak."
+            )
+            self.input_level_bar.set(0)
+            self.input_level_hint.configure(
+                text="Microphone idle", text_color="gray"
+            )
             self.status_label.configure(text="ההקלטה נעצרה", text_color="orange")
 
+    def _apply_stream_result(self, text: str) -> None:
+        preview = (text or "").strip()
+        if preview:
+            self.live_label.configure(text=f"Transcript: {preview[:280]}")
+            self.compare_texts(preview)
+
+    def _level_ui_tick(self) -> None:
+        """Update mic level bar from smoothed RMS (main thread)."""
+        if not self.is_recording:
+            self.input_level_bar.set(0)
+            self.input_level_hint.configure(text="Microphone idle", text_color="gray")
+            return
+        with self._audio_lock:
+            lv = float(getattr(self, "_mic_level", 0.0))
+        lv = max(0.0, min(1.0, lv))
+        self.input_level_bar.set(lv)
+        if lv < 0.04:
+            self.input_level_hint.configure(
+                text="Quiet — speak closer to the mic or raise volume",
+                text_color="#888888",
+            )
+        elif lv < 0.12:
+            self.input_level_hint.configure(
+                text="Low level — keep speaking",
+                text_color="#CCCCAA",
+            )
+        else:
+            self.input_level_hint.configure(
+                text="Sound detected — good input level",
+                text_color="#2ECC71",
+            )
+        self.after(70, self._level_ui_tick)
+
     def process_audio_loop(self):
-        """Background capture + Whisper; model preloaded before first listen."""
+        """Real-time style: mic capture runs continuously; we transcribe overlapping windows often."""
+        import numpy as np
 
         def set_status(msg: str, color: str = "white") -> None:
             self.after(
@@ -322,6 +436,9 @@ class ReadingCoach(ctk.CTk):
                     text=m, text_color=c
                 ),
             )
+
+        def set_live(msg: str) -> None:
+            self.after(0, lambda m=msg: self.live_label.configure(text=m))
 
         set_status("Loading Whisper model (first run may download ~75MB)…", "#AED6F1")
         try:
@@ -332,62 +449,113 @@ class ReadingCoach(ctk.CTk):
             self.after(0, self._set_record_button_idle)
             return
 
-        ambient_done = False
+        try:
+            import sounddevice as sd
+        except ImportError:
+            set_status("Install: pip install sounddevice numpy", "red")
+            self.is_recording = False
+            self.after(0, self._set_record_button_idle)
+            return
+
+        sr = self._sample_rate
+        # Shorter window + faster step → snappier (more CPU)
+        step = 0.55
+        max_buf_sec = 5.5
+        max_samples = int(sr * max_buf_sec)
+
+        with self._audio_lock:
+            self._audio_buffer = np.zeros(0, dtype=np.float32)
+
+        def mic_reader():
+            block = int(sr * 0.05)
+            try:
+                with sd.InputStream(
+                    samplerate=sr,
+                    channels=1,
+                    dtype=np.float32,
+                    blocksize=block,
+                ) as stream:
+                    while self.is_recording:
+                        data, overflowed = stream.read(block)
+                        if overflowed:
+                            pass
+                        chunk = np.asarray(data, dtype=np.float32).reshape(-1)
+                        if chunk.size:
+                            rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
+                            instant = min(1.0, rms * 12.0)
+                            with self._audio_lock:
+                                b = self._audio_buffer
+                                if b is None:
+                                    continue
+                                prev = float(getattr(self, "_mic_level", 0.0))
+                                self._mic_level = prev * 0.78 + instant * 0.22
+                                self._audio_buffer = np.concatenate([b, chunk])
+                                if self._audio_buffer.size > max_samples:
+                                    self._audio_buffer = self._audio_buffer[-max_samples:]
+            except Exception as ex:
+                self.after(
+                    0,
+                    lambda e=str(ex): self.status_label.configure(
+                        text=f"Mic stream error: {e[:120]}",
+                        text_color="red",
+                    ),
+                )
+                self.is_recording = False
+
+        reader = threading.Thread(target=mic_reader, daemon=True)
+        reader.start()
+
+        self._mic_level = 0.0
+        self.after(0, self._level_ui_tick)
+
+        set_status("Listening (live)… speak continuously.", "#AED6F1")
+        set_live("Transcript: …")
+
         while self.is_recording:
-            with sr.Microphone() as source:
-                try:
-                    if not ambient_done:
-                        self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                        ambient_done = True
-                    timeout = float(self.listen_timeout.get())
-                    phrase_limit = min(30.0, max(10.0, timeout + 8.0))
-                    set_status("Listening… speak now.", "white")
-                    audio = self.recognizer.listen(
-                        source,
-                        timeout=timeout,
-                        phrase_time_limit=phrase_limit,
-                    )
-                    set_status("Transcribing…", "#AED6F1")
-                    recognized = self._transcribe_audio(audio)
-                    if not (recognized or "").strip():
-                        set_status(
-                            "No words recognized — speak louder or check mic.",
-                            "orange",
-                        )
-                        continue
-                except RuntimeError as e:
-                    msg = str(e)
-                    self.after(
-                        0,
-                        lambda m=msg: self.status_label.configure(
-                            text=m[:120], text_color="red"
-                        ),
-                    )
-                    continue
-                except sr.WaitTimeoutError:
-                    set_status(
-                        "No speech detected in time — still listening…",
-                        "orange",
-                    )
-                    continue
-                except sr.UnknownValueError:
-                    set_status("Could not decode audio — try again.", "orange")
-                    continue
-                except Exception as ex:
-                    set_status(f"Audio error: {ex!s}"[:160], "red")
-                    continue
+            time.sleep(step)
+            with self._audio_lock:
+                snap = (
+                    None
+                    if self._audio_buffer is None
+                    else self._audio_buffer.copy()
+                )
+            if snap is None or snap.size < int(sr * 0.22):
+                continue
 
-                sync = threading.Event()
+            set_status("Transcribing…", "#AED6F1")
+            t0 = time.monotonic()
+            try:
+                text = self._transcribe_numpy(snap)
+            except Exception as ex:
+                self.after(
+                    0,
+                    lambda e=str(ex): self.status_label.configure(
+                        text=f"Transcribe error: {e[:100]}",
+                        text_color="red",
+                    ),
+                )
+                continue
+            dt = time.monotonic() - t0
+            if self.is_recording:
+                set_status(
+                    f"Listening (live)… last pass {dt:.1f}s",
+                    "#AED6F1",
+                )
 
-                def apply_result(rec=recognized):
-                    try:
-                        self.compare_texts(rec)
-                    finally:
-                        sync.set()
+            if not (text or "").strip():
+                continue
 
-                self.after(0, apply_result)
-                sync.wait(timeout=30)
+            self.after(0, lambda t=text: self._apply_stream_result(t))
 
+        with self._audio_lock:
+            self._audio_buffer = None
+            self._mic_level = 0.0
+
+        def _zero_hearing_ui():
+            self.input_level_bar.set(0)
+            self.input_level_hint.configure(text="Microphone idle", text_color="gray")
+
+        self.after(0, _zero_hearing_ui)
         self.after(0, self._on_record_loop_stopped)
 
     def _on_record_loop_stopped(self):
