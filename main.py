@@ -61,6 +61,15 @@ READING_PASSAGES: list[tuple[str, str]] = [
             ]
         ),
     ),
+    (
+        "3 · Story: Teacher & Danny (apples)",
+        " ".join(
+            [
+                'הַמּוֹרֶה שָׁאַל אֶת הַתַּלְמִיד: "דָּנִי, אִם יֵשׁ לִי חֲמִשָּׁה תַּפּוּחִים בְּיָד אַחַת וַחֲמִשָּׁה תַּפּוּחִים בַּיָּד הַשְּׁנִיָּה, מָה יֵשׁ לִי?"',
+                'דָּנִי חָשַׁב לְרֶגַע וְעָנָה בְּחִיּוּךְ: "יֵשׁ לְךָ יָדַיִם מַמָּשׁ גְּדוֹלוֹת, הַמּוֹרֶה!"',
+            ]
+        ),
+    ),
 ]
 
 WORD_POINTS = 10
@@ -445,7 +454,7 @@ class ReadingCoach(ctk.CTk):
         canvas.xview_moveto(frac)
 
     def update_display(self):
-        """מציג כל מילה כ־Label; מילים שנקראו בירוק. סדר: ימין→שמאל (המילה הראשונה בימין)."""
+        """Word colors: done=green, current=bright (full niqqud visible), upcoming=dim gray. RTL pack."""
         for child in self.words_scroll.winfo_children():
             child.destroy()
         self._word_labels = []
@@ -466,19 +475,18 @@ class ReadingCoach(ctk.CTk):
         bold_font = ctk.CTkFont(
             family=self._font_family, size=fs, weight="bold", underline=False
         )
-        bold_underline_font = ctk.CTkFont(
-            family=self._font_family, size=fs, weight="bold", underline=True
-        )
+        # Dark scroll area: "black" reads best as high-contrast light text; no underline (keeps niqqud clear)
+        color_done = "#2ECC71"
+        color_current = "#F5F5F5"
+        color_upcoming = "#5C5C5C"
         for i, word in enumerate(words):
             if i < done:
-                color = "#2ECC71"
-                font_arg = bold_font
+                color = color_done
             elif i == done and done < n:
-                color = "#E8E8E8"
-                font_arg = bold_underline_font
+                color = color_current
             else:
-                color = "#CCCCCC"
-                font_arg = bold_font
+                color = color_upcoming
+            font_arg = bold_font
             wlab = ctk.CTkLabel(
                 self.words_scroll,
                 text=word,
