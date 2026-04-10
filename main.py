@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import random
 import re
 import sys
 from difflib import SequenceMatcher
@@ -62,6 +63,9 @@ READING_PASSAGES: list[tuple[str, str]] = [
     ),
 ]
 
+WORD_POINTS = 10
+STORY_BONUS_POINTS = 50
+
 
 class ReadingCoach(ctk.CTk):
     def __init__(self):
@@ -69,8 +73,8 @@ class ReadingCoach(ctk.CTk):
         self._font_family = self._pick_hebrew_font()
 
         self.title("מאמן קריאה חכם - עברית")
-        self.geometry("800x600")
-        self.minsize(640, 480)
+        self.geometry("920x680")
+        self.minsize(720, 520)
 
         self.target_text = READING_PASSAGES[0][1]
         self.is_recording = False
@@ -91,6 +95,9 @@ class ReadingCoach(ctk.CTk):
         self.word_match_ratio_threshold = 0.8
         # Only transcribe the last N seconds + single-word prompt — less full-sentence drift
         self.transcribe_focus_tail_sec = 1.5
+        self.session_points = 0
+        self._word_labels: list = []
+        self._feedback_after_id = None
 
         self.setup_ui()
 
@@ -201,6 +208,23 @@ class ReadingCoach(ctk.CTk):
         )
         self.label_title.pack(pady=10, side="top")
 
+        self.score_row = ctk.CTkFrame(self, fg_color="transparent")
+        self.score_row.pack(fill="x", padx=28, pady=(0, 4))
+        self.points_label = ctk.CTkLabel(
+            self.score_row,
+            text="Points: 0",
+            font=(self._font_family, 18, "bold"),
+            text_color="#F4D03F",
+        )
+        self.points_label.pack(side="left", padx=(0, 16))
+        self.feedback_label = ctk.CTkLabel(
+            self.score_row,
+            text="",
+            font=(self._font_family, 16, "bold"),
+            text_color="#2ECC71",
+        )
+        self.feedback_label.pack(side="left")
+
         self.passage_bar = ctk.CTkFrame(self, fg_color="transparent")
         self.passage_bar.pack(fill="x", padx=28, pady=(0, 6))
         ctk.CTkLabel(
@@ -306,9 +330,16 @@ class ReadingCoach(ctk.CTk):
         )
         self.live_label.pack(fill="x", padx=14, pady=(0, 16))
 
-        self.words_inner = ctk.CTkFrame(self.text_frame, fg_color="#242424")
-        self.words_inner.pack(
-            fill="both", expand=True, padx=20, pady=(20, 8)
+        self.words_scroll = ctk.CTkScrollableFrame(
+            self.text_frame,
+            orientation="horizontal",
+            fg_color="#242424",
+            height=150,
+            scrollbar_button_color="#3d4159",
+            scrollbar_button_hover_color="#5c6bc0",
+        )
+        self.words_scroll.pack(
+            fill="both", expand=True, padx=12, pady=(12, 8)
         )
 
         self.update_display()
@@ -385,15 +416,44 @@ class ReadingCoach(ctk.CTk):
     def _apply_font_size(self):
         self.update_display()
 
+    def _scroll_focus_word_to_center(self) -> None:
+        """Keep the current word in the middle of the horizontal scroll view."""
+        labels = getattr(self, "_word_labels", None)
+        if not labels:
+            return
+        sc = self.words_scroll
+        try:
+            canvas = sc._parent_canvas
+        except AttributeError:
+            return
+        self.update_idletasks()
+        bbox = canvas.bbox("all")
+        if not bbox:
+            return
+        total_w = max(bbox[2] - bbox[0], 1)
+        vw = max(canvas.winfo_width(), 1)
+        idx = self.max_word_progress
+        if idx >= len(labels):
+            idx = len(labels) - 1
+        if idx < 0:
+            return
+        lbl = labels[idx]
+        cx = lbl.winfo_x() + lbl.winfo_width() / 2
+        target_left = cx - vw / 2
+        target_left = max(0.0, min(target_left, max(total_w - vw, 0)))
+        frac = target_left / total_w if total_w > 0 else 0.0
+        canvas.xview_moveto(frac)
+
     def update_display(self):
         """מציג כל מילה כ־Label; מילים שנקראו בירוק. סדר: ימין→שמאל (המילה הראשונה בימין)."""
-        for child in self.words_inner.winfo_children():
+        for child in self.words_scroll.winfo_children():
             child.destroy()
+        self._word_labels = []
 
         words = split_words(self.target_text)
         if not words:
             ctk.CTkLabel(
-                self.words_inner,
+                self.words_scroll,
                 text="(הוסף משפט בהגדרות)",
                 text_color="gray",
                 font=(self._font_family, 20),
@@ -419,12 +479,56 @@ class ReadingCoach(ctk.CTk):
             else:
                 color = "#CCCCCC"
                 font_arg = bold_font
-            ctk.CTkLabel(
-                self.words_inner,
+            wlab = ctk.CTkLabel(
+                self.words_scroll,
                 text=word,
                 text_color=color,
                 font=font_arg,
-            ).pack(side="right", padx=6, pady=8)
+            )
+            wlab.pack(side="right", padx=6, pady=8)
+            self._word_labels.append(wlab)
+        self.after(20, self._scroll_focus_word_to_center)
+
+    def _update_points_display(self) -> None:
+        self.points_label.configure(text=f"Points: {self.session_points}")
+
+    def _clear_feedback(self) -> None:
+        self.feedback_label.configure(text="")
+        self._feedback_after_id = None
+
+    def _show_word_feedback(self) -> None:
+        cheers = [
+            "Nice!",
+            "Great job!",
+            "You got it!",
+            "Super!",
+            "Well done!",
+            "Awesome!",
+            "Perfect!",
+            "Keep going!",
+        ]
+        self.feedback_label.configure(
+            text=f"+{WORD_POINTS}  {random.choice(cheers)}",
+            text_color="#2ECC71",
+        )
+        if self._feedback_after_id is not None:
+            try:
+                self.after_cancel(self._feedback_after_id)
+            except Exception:
+                pass
+        self._feedback_after_id = self.after(2200, self._clear_feedback)
+
+    def _show_story_complete_feedback(self) -> None:
+        if self._feedback_after_id is not None:
+            try:
+                self.after_cancel(self._feedback_after_id)
+            except Exception:
+                pass
+        self.feedback_label.configure(
+            text=f"+{STORY_BONUS_POINTS}  Story finished — you're a star!",
+            text_color="#F39C12",
+        )
+        self._feedback_after_id = self.after(4500, self._clear_feedback)
 
     def sync_passage_menu_state(self) -> None:
         self.passage_menu.configure(state="disabled" if self.is_recording else "normal")
@@ -435,11 +539,17 @@ class ReadingCoach(ctk.CTk):
                 self.target_text = text
                 break
         self.max_word_progress = 0
+        self.session_points = 0
+        self._update_points_display()
+        self._clear_feedback()
         self.update_display()
 
     def reset_practice(self):
         self.is_recording = False
         self.max_word_progress = 0
+        self.session_points = 0
+        self._update_points_display()
+        self._clear_feedback()
         self._set_record_button_idle()
         self.update_display()
         self.sync_passage_menu_state()
@@ -737,6 +847,12 @@ class ReadingCoach(ctk.CTk):
         candidate = cur + 1 if matched else cur
         candidate = min(candidate, len(target_words))
         new_total = max(prev, min(candidate, prev + 1))
+
+        if new_total > prev:
+            self.session_points += WORD_POINTS
+            self._update_points_display()
+            self._show_word_feedback()
+
         self.max_word_progress = new_total
 
         current_match = new_total
@@ -745,6 +861,9 @@ class ReadingCoach(ctk.CTk):
 
         n_target = len(target_words)
         if n_target > 0 and self.max_word_progress >= n_target:
+            self.session_points += STORY_BONUS_POINTS
+            self._update_points_display()
+            self._show_story_complete_feedback()
             self.status_label.configure(
                 text="אלוף! סיימת את המשפט! 🎉", text_color="green"
             )
