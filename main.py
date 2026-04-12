@@ -29,6 +29,9 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
         pass
 
 NIQQUD_RE = re.compile(r"[\u0591-\u05C7]")
+# Hebrew letters + Hebrew presentation forms (letters only; niqqud stripped separately)
+HEBREW_LETTERS_RE = re.compile(r"[^\u0590-\u05FF]")
+HE_HEBREW = "\u05D4"  # letter he (often definite article הـ)
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -100,8 +103,8 @@ class ReadingCoach(ctk.CTk):
         self._audio_buffer = None  # numpy float32 mono, set when streaming starts
         self._sample_rate = 16000
         self._mic_level = 0.0  # smoothed 0..1 for UI meter
-        # התאמה מעורפלת בין מילה למילה (ילדים: חיתוך עיצורים, בליעת עיצורים)
-        self.word_match_ratio_threshold = 0.8
+        # Validator-style fuzzy match (more forgiving for child pronunciation)
+        self.word_match_ratio_threshold = 0.7
         # Only transcribe the last N seconds + single-word prompt — less full-sentence drift
         self.transcribe_focus_tail_sec = 1.5
         self.session_points = 0
@@ -138,8 +141,16 @@ class ReadingCoach(ctk.CTk):
         i = self.max_word_progress
         return words[i] if i < len(words) else None
 
+    def _whisper_prompt_next_word_only(self) -> str:
+        """
+        Pass only the next word we expect as initial_prompt.
+        Whisper's job is closer to "did they say this word?" than "transcribe the whole line."
+        """
+        w = self._current_target_word()
+        return w.strip() if w else ""
+
     def _transcribe_numpy(self, samples) -> str:
-        """Transcribe mono float32 PCM (e.g. numpy array), 16 kHz — tuned for one word at a time."""
+        """Transcribe mono float32 — biased with the single next target word only."""
         import numpy as np
 
         if samples is None or len(samples) < int(self._sample_rate * 0.18):
@@ -152,6 +163,7 @@ class ReadingCoach(ctk.CTk):
         if x.size > max_tail:
             x = x[-max_tail:]
         model = self._ensure_whisper()
+        prompt = self._whisper_prompt_next_word_only()
         transcribe_kw = {
             "language": "he",
             "beam_size": 1,
@@ -160,9 +172,8 @@ class ReadingCoach(ctk.CTk):
             "condition_on_previous_text": False,
             "without_timestamps": True,
         }
-        cw = self._current_target_word()
-        if cw:
-            transcribe_kw["initial_prompt"] = cw
+        if prompt:
+            transcribe_kw["initial_prompt"] = prompt
         with self._whisper_lock:
             segments, _info = model.transcribe(x, **transcribe_kw)
         parts = [s.text.strip() for s in segments if s.text.strip()]
@@ -176,12 +187,16 @@ class ReadingCoach(ctk.CTk):
             with os.fdopen(fd, "wb") as f:
                 f.write(wav_bytes)
             model = self._ensure_whisper()
+            prompt = self._whisper_prompt_next_word_only()
             kw = {
                 "language": "he",
                 "beam_size": 1,
                 "best_of": 1,
                 "vad_filter": False,
+                "without_timestamps": True,
             }
+            if prompt:
+                kw["initial_prompt"] = prompt
             with self._whisper_lock:
                 segments, _info = model.transcribe(path, **kw)
             parts = [s.text.strip() for s in segments if s.text.strip()]
@@ -504,7 +519,7 @@ class ReadingCoach(ctk.CTk):
         self.feedback_label.configure(text="")
         self._feedback_after_id = None
 
-    def _show_word_feedback(self) -> None:
+    def _show_word_feedback(self, words_gained: int = 1) -> None:
         cheers = [
             "Nice!",
             "Great job!",
@@ -515,8 +530,9 @@ class ReadingCoach(ctk.CTk):
             "Perfect!",
             "Keep going!",
         ]
+        pts = max(1, words_gained) * WORD_POINTS
         self.feedback_label.configure(
-            text=f"+{WORD_POINTS}  {random.choice(cheers)}",
+            text=f"+{pts}  {random.choice(cheers)}",
             text_color="#2ECC71",
         )
         if self._feedback_after_id is not None:
@@ -822,16 +838,53 @@ class ReadingCoach(ctk.CTk):
         no_punct = re.sub(r"[^\w\s]", "", no_niq, flags=re.UNICODE)
         return re.sub(r"\s+", " ", no_punct).strip()
 
-    def is_word_match(self, spoken_word: str, target_word: str) -> bool:
-        """האם המילה הדומה מספיק ליעד (הגייה / טעויות מודל קלות)."""
-        s1 = spoken_word.strip()
-        s2 = target_word.strip()
-        if s1 == s2:
-            return True
+    def _normalize_word_for_match(self, w: str) -> str:
+        """Strip niqqud, punctuation, non-Hebrew; keep letters only for comparison."""
+        w = remove_niqqud(w.strip())
+        return HEBREW_LETTERS_RE.sub("", w)
+
+    def is_fuzzy_match(self, spoken: str, target: str) -> bool:
+        """Hebrew-only fuzzy match; forgiving for kids; handles optional leading ה (definite article)."""
+        s1 = self._normalize_word_for_match(spoken)
+        s2 = self._normalize_word_for_match(target)
         if not s1 or not s2:
             return False
-        thr = float(getattr(self, "word_match_ratio_threshold", 0.8))
-        return SequenceMatcher(None, s1, s2).ratio() >= thr
+        if s1 == s2:
+            return True
+        thr = float(getattr(self, "word_match_ratio_threshold", 0.7))
+        if SequenceMatcher(None, s1, s2).ratio() >= thr:
+            return True
+        if len(s1) > 1 and s1[0] == HE_HEBREW:
+            if SequenceMatcher(None, s1[1:], s2).ratio() >= thr:
+                return True
+        if len(s2) > 1 and s2[0] == HE_HEBREW:
+            if SequenceMatcher(None, s1, s2[1:]).ratio() >= thr:
+                return True
+        return False
+
+    def _align_progress_index(
+        self,
+        rec_words: list[str],
+        target_words: list[str],
+        start_idx: int,
+    ) -> int:
+        """
+        Validator-style alignment: look at the last few heard words vs the next target words.
+        Progress is sticky (never decreases). Up to 3 words advanced per pass.
+        """
+        if start_idx >= len(target_words) or not rec_words:
+            return start_idx
+        tail = rec_words[-5:] if len(rec_words) > 5 else rec_words
+        current_idx = start_idx
+        win_hi = min(start_idx + 3, len(target_words))
+        for i in range(start_idx, win_hi):
+            tw = target_words[i]
+            match_found = any(self.is_fuzzy_match(sw, tw) for sw in tail)
+            if match_found:
+                current_idx = i + 1
+            else:
+                break
+        return max(start_idx, current_idx)
 
     def compare_texts(self, recognized: str):
         target_clean = remove_niqqud(self.target_text).strip()
@@ -843,23 +896,18 @@ class ReadingCoach(ctk.CTk):
         if not target_words:
             return
 
-        cur = self.max_word_progress
-        if cur >= len(target_words):
+        prev = self.max_word_progress
+        if prev >= len(target_words):
             return
 
-        tw = target_words[cur]
-        # Any token in this short tail transcript can match the one word we care about now
-        matched = any(self.is_word_match(rw, tw) for rw in rec_words)
-
-        prev = self.max_word_progress
-        candidate = cur + 1 if matched else cur
-        candidate = min(candidate, len(target_words))
-        new_total = max(prev, min(candidate, prev + 1))
+        new_total = self._align_progress_index(rec_words, target_words, prev)
+        new_total = min(new_total, len(target_words))
 
         if new_total > prev:
-            self.session_points += WORD_POINTS
+            gained = new_total - prev
+            self.session_points += gained * WORD_POINTS
             self._update_points_display()
-            self._show_word_feedback()
+            self._show_word_feedback(gained)
 
         self.max_word_progress = new_total
 
